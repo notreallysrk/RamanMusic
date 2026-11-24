@@ -5,6 +5,7 @@ Normal chat keyboards never fall back to old inline delivery.
 See RICH_BUTTON_MIGRATION.md for the runtime audit and validation.
 """
 
+import asyncio
 import inspect
 import copy
 from datetime import datetime, timezone
@@ -13,10 +14,23 @@ import re
 from html import escape
 
 from pyrogram import Client, raw, types
+from pyrogram.errors import FloodWait
 from pyrogram.enums import ChatType, MessageEntityType, ParseMode
 from pyrogram.parser import Parser
 from pyrogram.parser.utils import add_surrogates, remove_surrogates
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InputRichMessage, Message, MessageEntity, ReplyParameters
+
+
+async def _call_with_floodwait_retry(call, *args, **kwargs):
+    """Retry a Telegram request after FloodWait, without changing its payload."""
+    for attempt in range(4):
+        try:
+            return await call(*args, **kwargs)
+        except FloodWait as exc:
+            if attempt == 3:
+                raise
+            wait_seconds = max(int(getattr(exc, "value", 1) or 1), 1)
+            await asyncio.sleep(wait_seconds + 1)
 
 
 class UnsupportedRichKeyboard(ValueError):
@@ -453,7 +467,7 @@ async def rich_call(method, *args, **kwargs):
             return await getattr(client, "send_" + tail)(**options)
         if "disable_web_page_preview" in legacy:
             kwargs["link_preview_options"] = types.LinkPreviewOptions(is_disabled=kwargs.pop("disable_web_page_preview"))
-        return await method(*args, **kwargs)
+        return await _call_with_floodwait_retry(method, *args, **kwargs)
 
     previous = await _message_blocks(message, client) if not sending and message is not None else []
     media_blocks = [block for block in previous if isinstance(block, tuple(cls for _, cls in _MEDIA.values()))]
@@ -484,15 +498,15 @@ async def rich_call(method, *args, **kwargs):
                 raise UnsupportedRichKeyboard(f"Kurigram send_rich_message cannot preserve {key}")
         allowed = inspect.signature(Client.send_rich_message).parameters.keys() - {"self", "rich_message", "reply_markup"}
         delivery = {key: value for key, value in options.items() if key in allowed}
-        result = await client.send_rich_message(**delivery, rich_message=rich_message)
+        result = await _call_with_floodwait_retry(client.send_rich_message, **delivery, rich_message=rich_message)
     elif is_callback and owner.inline_message_id:
-        result = await client.edit_inline_text(inline_message_id=owner.inline_message_id, rich_message=rich_message)
+        result = await _call_with_floodwait_retry(client.edit_inline_text, inline_message_id=owner.inline_message_id, rich_message=rich_message)
     else:
         delivery = {"chat_id": message.chat.id, "message_id": message.id}
         for key in ("schedule_date", "business_connection_id"):
             if options.get(key) is not None:
                 delivery[key] = options[key]
-        result = await client.edit_message_text(**delivery, rich_message=rich_message)
+        result = await _call_with_floodwait_retry(client.edit_message_text, **delivery, rich_message=rich_message)
     # Pin uploaded media to Telegram file IDs even when a sparse send response
     # omits its blocks. Player thumbnails may be deleted locally after sending.
     if sending and media_blocks and isinstance(result, Message) and not result.rich_message:
